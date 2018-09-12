@@ -18,13 +18,14 @@ class Model(object):
 
     def __init__(self, policy, env, nsteps,
             ent_coef=0.01, vf_coef=0.5, max_grad_norm=0.5, lr=7e-4,
-            alpha=0.99, epsilon=1e-5, total_timesteps=int(80e6), lrschedule='linear'):
+            alpha=0.99, epsilon=1e-5, total_timesteps=int(80e6), lrschedule='linear', steps_already=0):
 
         sess = tf_util.get_session()
         nenvs = env.num_envs
         nbatch = nenvs*nsteps
 
 
+        # note: this is using same weights for both actor and critic
         with tf.variable_scope('a2c_model', reuse=tf.AUTO_REUSE):
             step_model = policy(nenvs, 1, sess)
             train_model = policy(nbatch, nsteps, sess)
@@ -51,6 +52,8 @@ class Model(object):
         _train = trainer.apply_gradients(grads)
 
         lr = Scheduler(v=lr, nvalues=total_timesteps, schedule=lrschedule)
+        # Starting from a chekpoint (last save's total timesteps)
+        lr.n = steps_already + 0.
 
         def train(obs, states, rewards, masks, actions, values):
             advs = rewards - values
@@ -95,6 +98,8 @@ def learn(
     gamma=0.99,
     log_interval=100,
     load_path=None,
+    checkpoint_path=None,
+    steps_already=0,
     **network_kwargs):
 
     '''
@@ -144,7 +149,18 @@ def learn(
 
     '''
 
+    import threading, time, os
+    def start_tensorboard(session):
+        time.sleep(10) # Wait until graph is setup
+        tb_path = os.path.join(logger.get_dir(), 'tb')
+        summary_writer = tf.summary.FileWriter(tb_path, graph=session.graph)
+        summary_op = tf.summary.merge_all()
+        tf_util.launch_tensorboard_in_background(tb_path)
 
+    if steps_already:
+        steps_already = int(steps_already)
+        print ("Loading original vars from", load_path)
+        print ("Starting from timestamp", steps_already)
 
     set_global_seeds(seed)
 
@@ -152,10 +168,16 @@ def learn(
     policy = build_policy(env, network, **network_kwargs)
 
     model = Model(policy=policy, env=env, nsteps=nsteps, ent_coef=ent_coef, vf_coef=vf_coef,
-        max_grad_norm=max_grad_norm, lr=lr, alpha=alpha, epsilon=epsilon, total_timesteps=total_timesteps, lrschedule=lrschedule)
+        max_grad_norm=max_grad_norm, lr=lr, alpha=alpha, epsilon=epsilon, total_timesteps=total_timesteps, lrschedule=lrschedule, steps_already=steps_already)
     if load_path is not None:
         model.load(load_path)
     runner = Runner(env, model, nsteps=nsteps, gamma=gamma)
+
+    ###
+    #session = tf.get_default_session()
+    #t = threading.Thread(target=start_tensorboard, args=([session]))
+    #t.start()
+    ###
 
     nbatch = nenvs*nsteps
     tstart = time.time()
@@ -167,11 +189,18 @@ def learn(
         if update % log_interval == 0 or update == 1:
             ev = explained_variance(values, rewards)
             logger.record_tabular("nupdates", update)
-            logger.record_tabular("total_timesteps", update*nbatch)
+            logger.record_tabular("total_timesteps", update*nbatch + steps_already)
+            logger.record_tabular("time_elapsed", nseconds)
             logger.record_tabular("fps", fps)
             logger.record_tabular("policy_entropy", float(policy_entropy))
             logger.record_tabular("value_loss", float(value_loss))
             logger.record_tabular("explained_variance", float(ev))
             logger.dump_tabular()
+
+        if checkpoint_path and update % 1000 == 0:
+            import os
+            checkpoint_path = os.path.expanduser(checkpoint_path)
+            print('Saving to', checkpoint_path)
+            model.save(checkpoint_path)
     return model
 
